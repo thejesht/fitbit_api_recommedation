@@ -11,7 +11,7 @@ warnings.filterwarnings("ignore")
 from datetime import date, timedelta
 
 from fitbit.client import FitbitClient
-from fitbit.database import (
+from fitbit.supabase_db import (
     init_db,
     upsert_daily_activity,
     upsert_daily_heartrate,

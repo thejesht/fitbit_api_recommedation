@@ -4,7 +4,6 @@ Handles the full authorization code flow and token management.
 """
 
 import os
-import json
 import base64
 import webbrowser
 import urllib.parse
@@ -14,6 +13,8 @@ from threading import Thread
 import requests
 from dotenv import load_dotenv
 
+from fitbit.supabase_db import get_conn
+
 load_dotenv()
 
 CLIENT_ID = os.getenv("FITBIT_CLIENT_ID")
@@ -21,7 +22,6 @@ CLIENT_SECRET = os.getenv("FITBIT_CLIENT_SECRET")
 REDIRECT_URL = os.getenv("FITBIT_REDIRECT_URL")
 AUTH_URI = os.getenv("FITBIT_AUTH_URI")
 TOKEN_URI = os.getenv("FITBIT_TOKEN_URI")
-TOKENS_FILE = "tokens.json"
 
 # Scopes focused on activity data
 SCOPES = "activity heartrate sleep"
@@ -30,16 +30,54 @@ SCOPES = "activity heartrate sleep"
 # ── Token storage ──────────────────────────────────────────────────────────────
 
 def save_tokens(tokens: dict):
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=2)
-    print(f"Tokens saved to {TOKENS_FILE}")
+    sql = """
+        INSERT INTO tokens (
+            user_label, access_token, refresh_token,
+            token_type, expires_in, scope, user_id, updated_at
+        )
+        VALUES ('primary', %(access_token)s, %(refresh_token)s,
+                %(token_type)s, %(expires_in)s, %(scope)s, %(user_id)s, NOW())
+        ON CONFLICT (user_label) DO UPDATE SET
+            access_token  = EXCLUDED.access_token,
+            refresh_token = EXCLUDED.refresh_token,
+            token_type    = EXCLUDED.token_type,
+            expires_in    = EXCLUDED.expires_in,
+            scope         = EXCLUDED.scope,
+            user_id       = EXCLUDED.user_id,
+            updated_at    = NOW()
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, {
+                "access_token":  tokens.get("access_token"),
+                "refresh_token": tokens.get("refresh_token"),
+                "token_type":    tokens.get("token_type"),
+                "expires_in":    tokens.get("expires_in"),
+                "scope":         tokens.get("scope"),
+                "user_id":       tokens.get("user_id"),
+            })
+    print("Tokens saved to Supabase.")
 
 
 def load_tokens() -> dict | None:
-    if os.path.exists(TOKENS_FILE):
-        with open(TOKENS_FILE) as f:
-            return json.load(f)
-    return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT access_token, refresh_token, token_type,
+                       expires_in, scope, user_id
+                FROM tokens WHERE user_label = 'primary'
+            """)
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return {
+                "access_token":  row[0],
+                "refresh_token": row[1],
+                "token_type":    row[2],
+                "expires_in":    row[3],
+                "scope":         row[4],
+                "user_id":       row[5],
+            }
 
 
 # ── OAuth flow ─────────────────────────────────────────────────────────────────
@@ -129,11 +167,16 @@ def refresh_access_token(refresh_token: str) -> dict:
 def get_valid_access_token() -> str:
     """
     Return a valid access token, refreshing automatically if needed.
-    Runs the full auth flow if no tokens exist yet.
+    Runs the full auth flow if no tokens exist yet (local only — blocked in CI).
     """
     tokens = load_tokens()
 
     if tokens is None:
+        if os.getenv("CI"):
+            raise RuntimeError(
+                "No tokens found in Supabase and running in CI. "
+                "Run the auth flow locally first to seed tokens."
+            )
         print("No tokens found — starting authorization flow...")
         tokens = run_auth_flow()
 

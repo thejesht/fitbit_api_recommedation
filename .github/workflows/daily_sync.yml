@@ -1,0 +1,35 @@
+name: Daily Fitbit Sync
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC daily — adjust to your preferred time
+  workflow_dispatch:        # manual trigger from GitHub UI for testing
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Fitbit sync
+        env:
+          FITBIT_CLIENT_ID:     ${{ secrets.FITBIT_CLIENT_ID }}
+          FITBIT_CLIENT_SECRET: ${{ secrets.FITBIT_CLIENT_SECRET }}
+          FITBIT_REDIRECT_URL:  ${{ secrets.FITBIT_REDIRECT_URL }}
+          FITBIT_AUTH_URI:      https://www.fitbit.com/oauth2/authorize
+          FITBIT_TOKEN_URI:     https://api.fitbit.com/oauth2/token
+          SUPABASE_DB_URL:      ${{ secrets.SUPABASE_DB_URL }}
+          CI:                   "true"
+        run: python sync.py
