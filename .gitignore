@@ -1,0 +1,16 @@
+# Credentials & tokens — never commit these
+.env
+tokens.json
+
+# Database — runtime data file
+fitbit_data.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
