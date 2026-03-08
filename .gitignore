@@ -5,6 +5,9 @@ tokens.json
 # Database — runtime data file
 fitbit_data.db
 
+# Output files — personal data, not for version control
+output/
+
 # Python
 __pycache__/
 *.pyc
