@@ -3,57 +3,237 @@
 ## Context
 The current project is a solid data pipeline (Fitbit API → Supabase) with some local sleep analysis scripts. But it's passive — you have to run scripts manually to get any value. The goal is to turn this into an **active daily health companion** that sends personalized insights to your phone every morning, like a personal Whoop/Oura but powered by 3 years of YOUR data.
 
+## AutoResearch Integration (Karpathy Loop for Fitness)
+
+### What is AutoResearch?
+[Karpathy's autoresearch](https://github.com/karpathy/autoresearch) is a 630-line autonomous experiment loop. The core pattern (the "Karpathy Loop") has 3 components:
+1. **An agent with one file it can modify** (the experiment code)
+2. **A single, objectively testable metric** to optimize
+3. **A fixed time limit per experiment**
+
+The agent runs continuously: hypothesize → modify code → run → measure → keep or discard → repeat. It ran 700 experiments in 2 days and found 20 genuine improvements to LLM training.
+
+### Adapting the Karpathy Loop for Fitness Recommendations
+
+**Goal:** Autonomously optimize the recommendation engine's rules, thresholds, and correlations by running hundreds of experiments against 3 years of historical Fitbit data overnight via GitHub Actions.
+
+#### The Three Components (Fitness Edition)
+
+```mermaid
+graph TD
+    subgraph "The Karpathy Loop — Fitness Edition"
+        A["1. AGENT + MUTABLE FILE<br/>LLM agent modifies<br/>recommendation_rules.py"] --> B["2. SINGLE METRIC<br/>Recommendation Accuracy Score<br/>(backtested against historical data)"]
+        B --> C["3. FIXED TIME BUDGET<br/>~30 seconds per experiment<br/>(SQL + pandas, no GPU needed)"]
+        C --> D{"Score improved?"}
+        D -->|Yes| E["git commit — keep change"]
+        D -->|No| F["git reset — discard change"]
+        E --> A
+        F --> A
+    end
+```
+
+#### How It Works — Detailed
+
+**The Metric: Recommendation Accuracy Score**
+
+The agent optimizes one number: "How often do the recommendations correctly predict/correlate with the next day's outcome?"
+
+Scoring method (backtested on historical data):
+- For each historical day, the engine generates recommendations using only data available up to that day
+- Each recommendation is scored against what actually happened next:
+  - "Recovery day" recommendation + actual low steps next day → +1 (correct)
+  - "Push harder" recommendation + actual high activity next day → +1 (correct)
+  - "Sleep timing" warning + actually worse deep sleep that night → +1 (correct)
+  - Incorrect prediction → 0
+- **Metric = correct predictions / total predictions across all historical days**
+
+This is analogous to Karpathy's `val_bpb` — a single number the agent tries to maximize.
+
+**The Mutable File: `recommendation_rules.py`**
+
+The agent can modify:
+- Rule thresholds (e.g., "readiness < 50" → try "readiness < 45" or "readiness < 55")
+- Correlation lookback windows (7-day rolling → try 5-day or 14-day)
+- Which data features each rule uses
+- Rule priority weights
+- Add entirely new rules it discovers from the data
+- Remove rules that don't improve the score
+
+**The Fixed Files (agent CANNOT modify):**
+- `fitbit/data.py` — data access layer (like Karpathy's `prepare.py`)
+- `autoresearch/evaluate.py` — backtesting harness that computes the accuracy score (like Karpathy's evaluation in `prepare.py`)
+- `autoresearch/program.md` — instructions for the agent
+
+#### File Structure
+
+```
+autoresearch/
+├── program.md                    # Agent instructions (human-edited)
+├── evaluate.py                   # Backtesting harness (FIXED, not modifiable)
+├── recommendation_rules.py       # THE MUTABLE FILE — agent modifies this
+├── results.tsv                   # Experiment log (commit, score, status, description)
+└── run.py                        # Orchestrator: calls LLM API, runs loop
+```
+
+#### The Experiment Loop (GitHub Actions)
+
+```mermaid
+sequenceDiagram
+    participant GHA as GitHub Actions
+    participant Agent as LLM Agent (Claude API)
+    participant Rules as recommendation_rules.py
+    participant Eval as evaluate.py
+    participant Supa as Supabase (3yr data)
+    participant Git as Git
+
+    GHA->>Agent: Start autoresearch loop
+
+    loop Each Experiment (~30s each, run for 2 hours)
+        Agent->>Rules: Read current rules
+        Agent->>Agent: Form hypothesis<br/>("What if I lower the recovery threshold to 45?")
+        Agent->>Rules: Modify rules file
+        Agent->>Git: git commit (save change)
+        Agent->>Eval: Run backtest
+        Eval->>Supa: Query 3 years of historical data
+        Eval->>Eval: For each historical day:<br/>generate recs → check next-day outcome
+        Eval-->>Agent: Accuracy score (e.g., 0.72)
+
+        alt Score improved
+            Agent->>Git: Keep commit ✓
+            Agent->>Agent: Log to results.tsv (keep)
+        else Score did not improve
+            Agent->>Git: git reset --hard (revert)
+            Agent->>Agent: Log to results.tsv (discard)
+        end
+    end
+
+    GHA->>GHA: Push best rules + results.tsv
+```
+
+#### program.md (Agent Instructions)
+
+The agent receives instructions similar to Karpathy's `program.md`:
+
+```markdown
+# Fitness Recommendation AutoResearch
+
+You are an autonomous research agent optimizing fitness recommendations.
+
+## Your task
+Modify `recommendation_rules.py` to maximize the recommendation accuracy
+score computed by `evaluate.py`. You CANNOT modify `evaluate.py` or any
+file in `fitbit/`.
+
+## Workflow per experiment
+1. Read `recommendation_rules.py` and `results.tsv`
+2. Form a hypothesis (what change might improve the score?)
+3. Edit `recommendation_rules.py`
+4. Run: `python autoresearch/evaluate.py`
+5. Read the score from stdout
+6. If improved → keep. If not → revert.
+7. Log result to `results.tsv`
+8. Repeat. Do NOT ask "should I keep going?" — run continuously.
+
+## What you can change
+- Rule thresholds and conditions
+- Feature combinations used in rules
+- Lookback windows for rolling computations
+- Rule priority weights
+- Add new rules based on patterns you discover
+- Remove rules that consistently score poorly
+
+## What you CANNOT change
+- evaluate.py (the scoring harness)
+- Any file in fitbit/ (the data layer)
+- The metric definition
+
+## Guidelines
+- Make one focused change per experiment
+- Keep changes small and testable
+- Read results.tsv to learn from past experiments
+- If stuck, try a completely different approach rather than small variations
+```
+
+#### evaluate.py (Backtesting Harness)
+
+The evaluation script:
+1. Loads all historical data from Supabase (activity + HR + sleep, joined)
+2. Splits into train (first 80%) and test (last 20%) periods
+3. For each day in the test period:
+   - Calls `generate_recommendations(date)` from `recommendation_rules.py` using only data up to that date
+   - Checks each recommendation against what actually happened next
+   - Scores: correct/incorrect
+4. Outputs single metric: `accuracy = correct / total`
+
+#### What the Agent Discovers (Expected Findings)
+
+Based on the 3 years of data patterns, the agent would likely discover and optimize:
+- The exact readiness threshold for "recovery day" recommendations (is it 45? 50? 55?)
+- Whether 7-day or 14-day rolling averages better predict next-day outcomes
+- Which sleep metric matters most for next-day predictions (deep sleep? efficiency? total duration?)
+- Whether bedtime or wake time is more predictive of sleep quality
+- Optimal step targets personalized to YOUR data (not a generic 10K)
+- Day-of-week-specific thresholds (Monday rules differ from Friday rules)
+- Whether HR zone minutes or resting HR is more actionable
+
+#### Integration with Phase 1
+
+The autoresearch loop is an **enhancement** to Phase 1, not a replacement:
+
+1. **Phase 1 (Weeks 1-2):** Build the recommendation engine with hand-tuned rules (the MVP)
+2. **AutoResearch (Week 3):** Point the Karpathy Loop at the recommendation engine and let it optimize overnight
+3. **Ongoing:** Run autoresearch weekly (Sunday night GitHub Actions cron) to continuously improve recommendations as new data accumulates
+
+#### GitHub Actions Workflow
+
+```yaml
+name: AutoResearch — Optimize Recommendations
+on:
+  schedule:
+    - cron: '0 22 * * 0'  # Every Sunday at 22:00 UTC
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  autoresearch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120   # 2-hour experiment budget
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+
+      - name: Run autoresearch loop
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python autoresearch/run.py --budget 7200  # 2 hours
+
+      - name: Push optimized rules
+        run: |
+          git config user.name "autoresearch-bot"
+          git config user.email "autoresearch@noreply"
+          git add autoresearch/recommendation_rules.py autoresearch/results.tsv
+          git commit -m "autoresearch: accuracy $(tail -1 autoresearch/results.tsv | cut -f2) ($(wc -l < autoresearch/results.tsv) experiments)"
+          git push
+```
+
+#### Cost Estimate
+
+- Each experiment: ~1 API call to Claude (hypothesis + code edit) ≈ $0.02-0.05
+- 2-hour budget at ~30s/experiment ≈ 240 experiments
+- Weekly cost: ~$5-12 in API calls
+- Value: continuously improving, personalized recommendations backed by statistical evidence
+
+---
+
 **User decisions:**
 - Delivery: Telegram Bot (daily push notifications)
 - Goal: Personal health companion (daily actionable value)
 - Scope: Lean MVP first (1-2 weeks), then iterate
 - Tech: Open to any packages needed
-
----
-
-## Architecture Vision
-
-```mermaid
-graph TB
-    subgraph Data Collection
-        FITBIT["Fitbit Web API"]
-        SYNC["sync.py"]
-        GHA["GitHub Actions<br/>Daily 01:00 UTC"]
-    end
-
-    subgraph Storage
-        SUPA[(Supabase PostgreSQL)]
-    end
-
-    subgraph Intelligence Engine
-        DATA["data.py<br/>Unified Data Access"]
-        READY["readiness.py<br/>Daily Readiness Score"]
-        RECS["recommendations.py<br/>Rule-Based Engine"]
-        TRENDS["trends.py<br/>Long-Term Trends"]
-        CORR["correlations.py<br/>Cross-Domain Analysis"]
-    end
-
-    subgraph Delivery
-        TG["Telegram Bot<br/>Daily Morning Digest"]
-        DASH["Streamlit Dashboard<br/>Interactive Exploration"]
-    end
-
-    FITBIT --> SYNC
-    GHA --> SYNC
-    SYNC --> SUPA
-    SUPA --> DATA
-    DATA --> READY
-    DATA --> RECS
-    DATA --> TRENDS
-    DATA --> CORR
-    READY --> RECS
-    READY --> TG
-    RECS --> TG
-    TRENDS --> TG
-    TRENDS --> DASH
-    CORR --> DASH
-    DATA --> DASH
-```
 
 ---
 
@@ -97,16 +277,6 @@ CREATE TABLE daily_readiness (
 );
 ```
 
-**Readiness Score Formula (0-100):**
-
-```mermaid
-graph LR
-    RHR["Resting HR Delta<br/>vs 30-day median"] -->|40%| SCORE["Readiness<br/>Score<br/>(0-100)"]
-    SLEEP["Sleep Duration<br/>vs 8-hr target"] -->|30%| SCORE
-    DEEP["Deep Sleep<br/>vs 30-day avg"] -->|20%| SCORE
-    REM["REM Sleep<br/>vs 30-day avg"] -->|10%| SCORE
-```
-
 - Move readiness formula from `sleep_window_analysis.py` into `engine/readiness.py`
 - **Make baselines dynamic:** rolling 30-day median RHR, rolling 30-day avg deep/REM (replace hardcoded 96/82)
 - Compute after each sync run; backfill all historical dates on first run
@@ -123,28 +293,6 @@ graph LR
 **New file:** `engine/recommendations.py`
 
 5 rule categories, each a function returning `Optional[Recommendation]`:
-
-```mermaid
-flowchart TD
-    DATA["Today's Data +<br/>Recent History"] --> R1
-    DATA --> R2
-    DATA --> R3
-    DATA --> R4
-    DATA --> R5
-
-    R1["Sleep Timing<br/>Bedtime outside 22:00-23:30?"]
-    R2["Recovery Day<br/>Readiness < 50?"]
-    R3["Trend Alert<br/>7-day RHR rising >3bpm?<br/>5+ short nights?"]
-    R4["Activity Nudge<br/>Steps < 5K for 3+ days?"]
-    R5["Weekend Pattern<br/>Monday: weekend sleep drift?"]
-
-    R1 --> RANK["Rank by Priority"]
-    R2 --> RANK
-    R3 --> RANK
-    R4 --> RANK
-    R5 --> RANK
-    RANK --> TOP["Top 5 Recommendations"]
-```
 
 | Rule | Trigger | Example Output |
 |------|---------|----------------|
@@ -192,29 +340,9 @@ Score: 72/100 (Good)
 📈 7-Day Trend: Readiness ↑3 pts | RHR stable | Sleep +18 min
 ```
 
-**End-to-end flow:**
-
-```mermaid
-sequenceDiagram
-    participant GHA as GitHub Actions
-    participant Sync as sync.py
-    participant Supa as Supabase
-    participant Engine as engine/
-    participant TG as Telegram Bot
-
-    GHA->>Sync: Cron trigger (01:00 UTC)
-    Sync->>Supa: Upsert activity + HR + sleep
-    Sync->>Engine: compute_readiness(today)
-    Engine->>Supa: Read joined data + 30-day baselines
-    Engine->>Supa: Store daily_readiness score
-    Sync->>Engine: generate_recommendations(today)
-    Engine->>Supa: Read readiness + recent trends
-    Engine->>Supa: Store daily_recommendations
-    Sync->>TG: send_daily_digest(today)
-    TG->>Supa: Read score + recommendations
-    TG->>TG: Format message
-    TG-->>GHA: ✅ Notification sent
-```
+**Integration with GitHub Actions:**
+- Add step after sync: `python -m notifications.telegram`
+- Add `python-telegram-bot` to requirements.txt
 
 **Files to modify:**
 - New: `notifications/__init__.py`, `notifications/telegram.py`
@@ -225,7 +353,7 @@ sequenceDiagram
 ---
 
 ### Phase 1 Milestone
-> Every morning, you receive a Telegram message with your readiness score and 3-5 personalized recommendations based on your 3-year data history.
+Every morning, you receive a Telegram message with your readiness score and 3-5 personalized recommendations based on your 3-year data history.
 
 ---
 
@@ -236,7 +364,7 @@ sequenceDiagram
 
 - Monthly aggregations: avg steps, avg RHR, avg sleep duration, avg readiness
 - Quarterly comparison: "Q1 2026 vs Q4 2025"
-- Resting HR trajectory: monthly averages over 3 years (this IS your cardio fitness score — a drop from 82→75 over a year is a meaningful health improvement, invisible in a 30-day view)
+- Resting HR trajectory: monthly averages over 3 years (cardio fitness proxy)
 - Seasonal patterns: does sleep quality vary by month? (with 3 years you can answer this)
 - Activity consistency score: std deviation of daily steps (consistent vs. spiky)
 - New table: `monthly_summaries` (cached aggregations)
@@ -256,25 +384,6 @@ sequenceDiagram
 - Best/worst day of the week and why
 - "This week vs last week" comparison
 
-```mermaid
-flowchart LR
-    subgraph Monday
-        WEEKLY["Weekly Digest<br/>Week summary + trends<br/>+ best/worst days"]
-    end
-
-    subgraph Daily
-        DAILY["Morning Digest<br/>Readiness + recommendations"]
-    end
-
-    subgraph On Demand
-        DASH["Dashboard<br/>Interactive exploration"]
-    end
-
-    DAILY --> |"Tue-Sun"| TG["📱 Telegram"]
-    WEEKLY --> |"Monday"| TG
-    DASH --> |"Anytime"| WEB["🌐 Browser"]
-```
-
 ---
 
 ## Phase 3: Web Dashboard (Weeks 6-8)
@@ -282,15 +391,12 @@ flowchart LR
 ### 3.1 Streamlit Dashboard
 **New file:** `dashboard/app.py`
 
-| Section | Content |
-|---------|---------|
-| **Today** | Readiness gauge, sleep summary, today's recommendations |
-| **Trends** | Interactive Plotly charts with date range selector (7d / 30d / 90d / 1y / all) |
-| **Sleep** | Migrate existing 7 chart types to interactive versions |
-| **Correlations** | Scatter plots from Phase 2 |
-| **Calendar** | Heatmap of readiness scores color-coded by day |
-
-- Deploy free on Streamlit Community Cloud (connects to GitHub repo)
+- Today panel: readiness gauge, sleep summary, recommendations
+- Trends tab: interactive Plotly charts with date range selector (7d/30d/90d/1y/all)
+- Sleep analysis tab: migrate existing 7 chart types to interactive versions
+- Correlations tab: scatter plots from Phase 2
+- Calendar heatmap: readiness scores color-coded by day
+- Deploy free on Streamlit Community Cloud
 - Add `streamlit`, `plotly` to requirements
 
 ---
@@ -298,7 +404,7 @@ flowchart LR
 ## Phase 4: Advanced Features (Weeks 9+)
 
 ### 4.1 Intraday Activity Patterns
-- Activate the unused `get_intraday()` method in `client.py` (already implemented, never called)
+- Activate the unused `get_intraday()` method in `client.py`
 - New table: `intraday_activity` (date, time, steps, calories)
 - Auto-detect workout sessions (consecutive high-activity windows)
 - Surface in daily digest: "45-min walk at 18:15 (4,200 steps)"
@@ -322,46 +428,21 @@ flowchart LR
 
 ## Implementation Order (Critical Path)
 
-```mermaid
-gantt
-    title Implementation Timeline
-    dateFormat  YYYY-MM-DD
-    axisFormat  %b %d
-
-    section Phase 1 - MVP
-    Data access layer          :p1a, 2026-03-31, 3d
-    Readiness score engine     :p1b, after p1a, 3d
-    Recommendation engine      :p1c, after p1b, 4d
-    Telegram bot + CI          :p1d, after p1c, 3d
-    MVP Complete               :milestone, after p1d, 0d
-
-    section Phase 2 - Analytics
-    Long-term trends           :p2a, after p1d, 5d
-    Cross-domain correlations  :p2b, after p2a, 4d
-    Weekly digest              :p2c, after p2b, 3d
-
-    section Phase 3 - Dashboard
-    Streamlit dashboard        :p3a, after p2c, 14d
-
-    section Phase 4 - Advanced
-    Intraday patterns          :p4a, after p3a, 5d
-    Goal tracking              :p4b, after p4a, 4d
-    Anomaly detection          :p4c, after p4b, 4d
+```
+Week 1:  [1.1] Data layer  →  [1.2] Readiness score
+Week 2:  [1.3] Recommendations  →  [1.4] Telegram bot
+         ─── MVP COMPLETE: daily value delivered ───
+Week 3:  [2.1] Trends engine
+Week 4:  [2.2] Correlations  →  [2.3] Weekly digest
+Week 5:  Buffer / polish
+Week 6-8: [3.1] Streamlit dashboard
+Week 9+: Phase 4 features as desired
 ```
 
----
-
-## New Project Structure (After Phase 1)
+## New Files Summary (Phase 1)
 
 ```
 fitbit_api_recommendation/
-├── fitbit/                      # Core library package
-│   ├── __init__.py
-│   ├── auth.py                  # OAuth 2.0 flow
-│   ├── client.py                # Fitbit API client
-│   ├── data.py                  # NEW — Unified data access layer
-│   ├── database.py              # SQLite layer (legacy)
-│   └── supabase_db.py           # Supabase layer (primary)
 ├── engine/                      # NEW — Intelligence layer
 │   ├── __init__.py
 │   ├── readiness.py             # Readiness score computation
@@ -371,39 +452,25 @@ fitbit_api_recommendation/
 ├── notifications/               # NEW — Delivery layer
 │   ├── __init__.py
 │   └── telegram.py              # Telegram bot for daily digest
-├── analysis/                    # Existing analysis scripts (migrated to Supabase)
-│   ├── sleep_analysis.py
-│   └── sleep_window_analysis.py
 ├── dashboard/                   # (Phase 3) Web UI
 │   └── app.py
-├── docs/                        # Documentation
-│   └── PRODUCT_ROADMAP.md
-├── .github/workflows/
-│   └── daily_sync.yml           # Extended: sync + readiness + recommendations + notify
-├── sync.py                      # Extended: triggers engine after sync
-├── scheduler.py
-├── .env.example
-└── requirements.txt             # Extended: + pandas, python-telegram-bot
+├── fitbit/
+│   ├── data.py                  # NEW — Unified data access layer
+│   └── ... (existing files)
+└── ... (existing files)
 ```
 
----
+## New Dependencies (Phase 1)
 
-## New Dependencies
+```
+pandas>=2.2
+python-telegram-bot>=21.0
+```
 
-| Phase | Package | Purpose |
-|-------|---------|---------|
-| 1 | `pandas>=2.2` | Data manipulation and joins |
-| 1 | `python-telegram-bot>=21.0` | Telegram notifications |
-| 2 | `scipy>=1.14` | Statistical correlations |
-| 3 | `streamlit>=1.40` | Web dashboard |
-| 3 | `plotly>=6.0` | Interactive charts |
+## Verification (Phase 1)
 
----
-
-## Verification Checklist (Phase 1)
-
-- [ ] `python sync.py` syncs data AND computes/stores readiness score
-- [ ] `SELECT * FROM daily_readiness ORDER BY date DESC LIMIT 5` shows scores in Supabase
-- [ ] `python -m engine.recommendations` prints today's recommendations
-- [ ] `python -m notifications.telegram` sends test message to Telegram
-- [ ] GitHub Actions workflow: sync → compute → notify end-to-end
+1. Run `python sync.py` — should sync data AND compute/store readiness score
+2. Query Supabase: `SELECT * FROM daily_readiness ORDER BY date DESC LIMIT 5` — should show scores
+3. Run `python -m engine.recommendations` — should print today's recommendations
+4. Run `python -m notifications.telegram` — should send test message to your Telegram
+5. Trigger GitHub Actions workflow — should sync + compute + notify end-to-end
